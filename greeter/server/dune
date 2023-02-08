@@ -1,0 +1,3 @@
+(executable
+ (name greeter_server)
+ (libraries greeter_pb grpc grpc-lwt ocaml-protoc lwt lwt.unix h2 h2-lwt-unix))
