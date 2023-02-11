@@ -1,4 +1,11 @@
 open Grpc_lwt
+open Lwt.Syntax
+
+let cacertfile = "./certs/ca.crt"
+let certfile = "./certs/server.crt"
+let keyfile = "./certs/server.pem"
+let port = 8081
+
 
 let say_hello buffer =
   let decoder = Pbrt.Decoder.of_string buffer in
@@ -16,15 +23,16 @@ let greeter_service =
   Server.Service.(
     v () |> add_rpc ~name:"Greet" ~rpc:(Unary say_hello) |> handle_request)
 
-let server =
+let greeter_server =
   Server.(
-    v () |> add_service ~name:"mypackage.Greeter" ~service:greeter_service)
+    v () |> add_service ~name:"ml_grpc_examples.Greeter" ~service:greeter_service)
 
 let () =
-  let open Lwt.Syntax in
-  let port = 8081 in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
   Lwt.async (fun () ->
+      (* make sure that client certificates are signed by this CA *)
+      let* authenticator = X509_lwt.authenticator (`Ca_file cacertfile) in
+      let* certificate = X509_lwt.private_of_pems ~cert:certfile ~priv_key:keyfile in
       let error_handler :
           Unix.sockaddr ->
           ?request:H2.Request.t ->
@@ -40,16 +48,32 @@ let () =
             (Status.default_reason_phrase error) end; *)
           H2.Body.Writer.close response_body
       in
-      let server =
-        let certfile = "./certs/server.crt" in
-        let keyfile = "./certs/server.pem" in
-        H2_lwt_unix.Server.TLS.create_connection_handler_with_default ~certfile
-          ~keyfile ?config:None
-          ~request_handler:(fun _ reqd -> Server.handle_request server reqd)
-          ~error_handler
+      let sockaddr2s = function
+            Unix.ADDR_UNIX fn -> fn
+          | Unix.ADDR_INET (ip, port) -> Printf.sprintf "%s:%d" (Unix.string_of_inet_addr ip) port
+      in
+      let server client_address client_socket  =
+        let* () = Lwt_io.printlf "new connection from %s" (sockaddr2s client_address) in
+        try
+          H2_lwt_unix.Server.TLS.create_connection_handler_full
+            ~certificates:(`Single certificate)
+            ?config:None
+            ~request_handler:(fun _ reqd -> Server.handle_request greeter_server reqd)
+            ~error_handler
+            ?ciphers:(Some [`CHACHA20_POLY1305_SHA256;`AES_256_GCM_SHA384])
+            ?version:(Some (`TLS_1_3, `TLS_1_3)) (* only TLS 1.3 *)
+            ?signature_algorithms:None
+            ?reneg:(Some false)
+            ?acceptable_cas:None
+            ?authenticator:(Some authenticator)
+            ?zero_rtt:(Some 0l)
+            ?ip:None
+            client_address client_socket
+        with failure ->
+          Lwt_io.printlf "Failure: %s" (Printexc.to_string failure)
       in
       let+ _server =
-        Lwt_io.establish_server_with_client_socket listen_address server
+        Lwt_io.establish_server_with_client_socket ?no_close:(Some false) ?backlog:(Some 12) listen_address server
       in
       Printf.printf "Listening on port %i for grpc requests\n" port;
       print_endline "";
